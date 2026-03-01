@@ -278,8 +278,67 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
 
+	origin := c.GetRegion(region.GetID())
+
+	// Credibility check: Case A - region exists locally
+	if origin != nil {
+		o := origin.GetRegionEpoch()
+		e := region.GetRegionEpoch()
+		if e.GetVersion() < o.GetVersion() || e.GetConfVer() < o.GetConfVer() {
+			return ErrRegionIsStale(region.GetMeta(), origin.GetMeta())
+		}
+	} else {
+		// Case B - region does not exist, check overlapping regions
+		overlaps := c.core.GetOverlaps(region)
+		for _, o := range overlaps {
+			oe := o.GetRegionEpoch()
+			re := region.GetRegionEpoch()
+			if re.GetVersion() < oe.GetVersion() ||
+				(re.GetVersion() == oe.GetVersion() && re.GetConfVer() < oe.GetConfVer()) {
+				return ErrRegionIsStale(region.GetMeta(), o.GetMeta())
+			}
+		}
+	}
+
+	// Skip redundant update
+	if origin != nil {
+		o := origin.GetRegionEpoch()
+		e := region.GetRegionEpoch()
+		sameVersion := e.GetVersion() == o.GetVersion() && e.GetConfVer() == o.GetConfVer()
+
+		leaderUnchanged := (region.GetLeader() == nil && origin.GetLeader() == nil) ||
+			(region.GetLeader() != nil && origin.GetLeader() != nil &&
+				region.GetLeader().GetId() == origin.GetLeader().GetId())
+
+		noPending := len(region.GetPendingPeers()) == 0 && len(origin.GetPendingPeers()) == 0
+		sizeUnchanged := region.GetApproximateSize() == origin.GetApproximateSize()
+
+		peersUnchanged := len(region.GetPeers()) == len(origin.GetPeers())
+		if peersUnchanged {
+			regionStores := region.GetStoreIds()
+			originStores := origin.GetStoreIds()
+			for storeID := range regionStores {
+				if _, ok := originStores[storeID]; !ok {
+					peersUnchanged = false
+					break
+				}
+			}
+		}
+
+		if sameVersion && leaderUnchanged && noPending && sizeUnchanged && peersUnchanged {
+			return nil
+		}
+	}
+
+	// Update region tree and store status
+	c.core.PutRegion(region)
+	for storeID := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(storeID)
+	}
+	c.prepareChecker.collect(region)
 	return nil
 }
 

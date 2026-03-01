@@ -304,34 +304,182 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 	return nil
 }
 
-// Append the given entries to the raft log and update ps.raftState also delete log entries that will
-// never be committed
+// Append writes new log entries to the Raft DB and deletes any entries that have
+// been superseded by a conflicting suffix from a newer leader.
+//
+// After a leader election, the new leader may send entries that conflict with
+// locally-stored entries from the old leader. Our in-memory RaftLog already
+// truncates the entries slice at the conflict point, but the old entries still
+// exist in BadgerDB. This function is responsible for overwriting them and
+// deleting any tail that is no longer valid.
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Persist each valid entry to the Raft DB. Entries at or below the
+	// truncated index have already been compacted into a snapshot and must
+	// not be stored again.
+	for i := range entries {
+		if entries[i].Index <= ps.truncatedIndex() {
+			continue
+		}
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entries[i].Index), &entries[i]); err != nil {
+			return err
+		}
+	}
+
+	newLastIndex := entries[len(entries)-1].Index
+	newLastTerm := entries[len(entries)-1].Term
+
+	// Delete any stale entries that used to be in the log beyond our new last
+	// index. This happens when a new leader sends a shorter (or conflicting)
+	// set of entries that replaces a longer local suffix.
+	oldLastIndex := ps.raftState.LastIndex
+	if newLastIndex < oldLastIndex {
+		for staleTailIndex := newLastIndex + 1; staleTailIndex <= oldLastIndex; staleTailIndex++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, staleTailIndex))
+		}
+	}
+
+	// Update the in-memory RaftLocalState so that callers writing the state to
+	// the DB (e.g. SaveReadyState) see the correct values.
+	ps.raftState.LastIndex = newLastIndex
+	ps.raftState.LastTerm = newLastTerm
+
 	return nil
 }
 
-// Apply the peer with given snapshot
+// ApplySnapshot installs an incoming snapshot by:
+//  1. Clearing all existing Raft metadata (log entries, raftState, applyState)
+//     from BadgerDB via the supplied write-batches.
+//  2. Writing the new applyState and RegionLocalState for the snapshot region
+//     to the KV BadgerDB (flushed atomically here, because SaveReadyState only
+//     flushes the raftWB).
+//  3. Updating in-memory state (raftState, applyState, region pointer).
+//  4. Scheduling the actual SST data ingestion via a RegionTaskApply worker task.
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
+
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	newRegion := snapData.Region
+	snapshotIndex := snapshot.Metadata.Index
+	snapshotTerm := snapshot.Metadata.Term
+
+	// Save the old region boundaries so we can return them and so the region
+	// worker knows which key range to purge before installing the snapshot data.
+	prevRegion := ps.region
+
+	// Enqueue deletions of all existing Raft log entries and metadata keys into
+	// the two write-batches. clearMeta writes Raft-DB deletions to raftWB and
+	// KV-DB metadata deletions (applyState, regionState) to kvWB.
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+
+	// Schedule destruction of any KV data that falls outside the new region's
+	// key range (happens asynchronously via the region worker).
+	ps.clearExtraData(newRegion)
+
+	// Advance raftState to the snapshot's index/term. SaveReadyState will write
+	// this to raftWB and flush it to the Raft BadgerDB after we return.
+	ps.raftState.LastIndex = snapshotIndex
+	ps.raftState.LastTerm = snapshotTerm
+
+	// Advance applyState: the snapshot covers all entries up to snapshotIndex.
+	ps.applyState.AppliedIndex = snapshotIndex
+	ps.applyState.TruncatedState.Index = snapshotIndex
+	ps.applyState.TruncatedState.Term = snapshotTerm
+
+	// Write the new applyState and the RegionLocalState for the snapshot region
+	// into kvWB, then flush to the KV BadgerDB now. We must flush here because
+	// SaveReadyState only flushes the raftWB; if we skip this flush, a crash
+	// between SaveReadyState returning and the region worker finishing would
+	// leave the KV metadata inconsistent.
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+
+	// Update the in-memory region pointer so the peer serves the correct key range.
+	ps.region = newRegion
+
+	// Mark snapState as Applying so the peer knows a snapshot ingestion is in
+	// flight. The region worker will signal the notifier channel when done.
+	applyNotifier := make(chan bool, 1)
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+
+	// Send the actual data-ingestion task to the region worker. It will clean up
+	// the old key range (using the *previous* region's boundaries) and then
+	// apply the snapshot SST files.
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: newRegion.Id,
+		Notifier: applyNotifier,
+		SnapMeta: snapshot.Metadata,
+		StartKey: prevRegion.GetStartKey(),
+		EndKey:   prevRegion.GetEndKey(),
+	}
+
+	return &ApplySnapResult{
+		PrevRegion: prevRegion,
+		Region:     newRegion,
+	}, nil
 }
 
-// Save memory states to disk.
-// Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// SaveReadyState durably writes all state from the Raft Ready struct to disk.
+// This must complete before any outgoing messages are delivered to peers,
+// because the Raft protocol requires that HardState is on disk before vote
+// grants or AppendEntries responses are sent.
+//
+// It writes to the Raft DB only (log entries + RaftLocalState). Applying
+// committed entries to the KV DB is handled separately in HandleRaftReady.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	raftWriteBatch := new(engine_util.WriteBatch)
+
+	// Handle an incoming snapshot (implemented in 2C). For 2B this branch
+	// will not be reached because the Raft layer does not produce snapshots yet.
+	var applySnapshotResult *ApplySnapResult
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		applySnapshotResult, err = ps.ApplySnapshot(&ready.Snapshot, new(engine_util.WriteBatch), raftWriteBatch)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Persist any new log entries and update ps.raftState.LastIndex/LastTerm.
+	if len(ready.Entries) > 0 {
+		if err := ps.Append(ready.Entries, raftWriteBatch); err != nil {
+			return nil, err
+		}
+	}
+
+	// If the HardState changed (term, vote, or commit advanced), update the
+	// in-memory pointer so it is included when we write RaftLocalState below.
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// Always write the full RaftLocalState. This atomically records the new
+	// LastIndex, LastTerm, and HardState so that the node can reconstruct the
+	// correct state after a crash.
+	if err := raftWriteBatch.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+
+	// Flush the entire write batch to the Raft BadgerDB in one atomic write.
+	if err := ps.Engines.WriteRaft(raftWriteBatch); err != nil {
+		return nil, err
+	}
+
+	return applySnapshotResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {
