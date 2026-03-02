@@ -367,7 +367,7 @@ func CreateMovePeerOperator(desc string, cluster Cluster, region *core.RegionInf
 
 // CreateOfflinePeerOperator creates an operator that replaces an old peer with a new peer when offline a store.
 func CreateOfflinePeerOperator(desc string, cluster Cluster, region *core.RegionInfo, kind OpKind, oldStore, newStore uint64, peerID uint64) (*Operator, error) {
-	k, steps, err := transferLeaderStep(cluster, region, oldStore, append(getRegionFollowerIDs(region)))
+	k, steps, err := transferLeaderStep(cluster, region, oldStore, getRegionFollowerIDs(region))
 	if err != nil {
 		return nil, err
 	}

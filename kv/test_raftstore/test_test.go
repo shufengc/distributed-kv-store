@@ -41,7 +41,8 @@ func SpawnClientsAndWait(t *testing.T, ch chan bool, ncli int, fn func(me int, t
 		ok := <-ca[cli]
 		// log.Infof("SpawnClientsAndWait: client %d is done\n", cli)
 		if ok == false {
-			t.Fatalf("failure")
+			t.Errorf("failure")
+			return
 		}
 	}
 
@@ -218,7 +219,8 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					values := cluster.Scan([]byte(start), []byte(end))
 					v := string(bytes.Join(values, []byte("")))
 					if v != last {
-						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+						t.Errorf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+						return
 					}
 				}
 			}
