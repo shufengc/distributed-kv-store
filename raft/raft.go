@@ -270,8 +270,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 func (r *Raft) becomeCandidate() {
 	r.State = StateCandidate
 	r.Lead = None
-	r.Term++           // Start a new election term.
-	r.Vote = r.id      // Vote for ourselves.
+	r.Term++      // Start a new election term.
+	r.Vote = r.id // Vote for ourselves.
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true // Record our own self-vote.
 

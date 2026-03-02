@@ -161,9 +161,9 @@ func isSoftStateChanged(current, previous *SoftState) bool {
 
 // Ready returns the current point-in-time state of this RawNode.
 // The returned Ready contains all information the application needs to:
-//   1. Persist HardState and unstable log Entries to stable storage.
-//   2. Send Messages to peer nodes.
-//   3. Apply CommittedEntries to the state machine.
+//  1. Persist HardState and unstable log Entries to stable storage.
+//  2. Send Messages to peer nodes.
+//  3. Apply CommittedEntries to the state machine.
 func (rn *RawNode) Ready() Ready {
 	rd := Ready{}
 
